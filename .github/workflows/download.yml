@@ -63,6 +63,18 @@ jobs:
             fi
           }
 
+          # Pack all staging files into a single tar and upload, then clean
+          pack_and_upload() {
+            local NAME=$1
+            if ls staging/*.zip staging/*.CHECKSUM >/dev/null 2>&1; then
+              local COUNT=$(ls staging/*.zip staging/*.CHECKSUM 2>/dev/null | wc -l)
+              echo "  [PACK] ${COUNT} files -> ${NAME}.tar"
+              tar -cf "staging/${NAME}.tar" -C staging $(ls staging/*.zip staging/*.CHECKSUM 2>/dev/null | sed 's|staging/||')
+              rm -f staging/*.zip staging/*.CHECKSUM
+              upload "staging/${NAME}.tar" "${SECTION}/${PAIR}/${INDNAME}/${NAME}.tar"
+            fi
+          }
+
           mkdir -p staging
 
           # ----- download helpers -----
@@ -113,7 +125,9 @@ jobs:
                       if [ ${GOT:-0} -ge 1 ]; then SKIP_BACKFILL=1; else SKIP_BACKFILL=0; fi
                     else
                       # No subfolder (aggTrades/fundingRate): must have all days
-                      if [ ${GOT:-0} -lt $NEED ]; then SKIP_BACKFILL=0; else SKIP_BACKFILL=1; fi
+                      # BUT: 1 file = old aggregated format (pre-2021), treat as complete
+                      if [ ${GOT:-0} -eq 1 ]; then SKIP_BACKFILL=1
+                      elif [ ${GOT:-0} -lt $NEED ]; then SKIP_BACKFILL=0; else SKIP_BACKFILL=1; fi
                     fi
 
                     if [ ${SKIP_BACKFILL:-0} -eq 0 ]; then
@@ -124,7 +138,7 @@ jobs:
                         DZN="${PAIR}-${ZIPFY}-${Y}-${MM}-${d}.zip"
                         DURL=$(daily_url "$BASE" "$INDNAME" "$PAIR" "$SUB" "$DZN")
                         echo -n "      [D] day ${d} ... "
-                        if curl -fSL --retry 2 --retry-delay 5 --max-time 120 -o "staging/${DZN}" "$DURL" 2>/dev/null; then
+                        if curl -fSL --retry 2 --retry-delay 3 --max-time 30 -o "staging/${DZN}" "$DURL" 2>/dev/null; then
                           echo "OK"; cksum_dl "staging/${DZN}" "$DURL"
                         else echo "N/A"; fi
                       done
@@ -137,14 +151,14 @@ jobs:
                       DURL=$(daily_url "$BASE" "$INDNAME" "$PAIR" "$SUB" "$DZN")
                       if [ -f "staging/${DZN}" ]; then echo -n "    [D] day ${d} ... SKIP"; echo ""; continue; fi
                       echo -n "    [D] day ${d} ... "
-                      if curl -fSL --retry 2 --retry-delay 5 --max-time 120 -o "staging/${DZN}" "$DURL" 2>/dev/null; then
+                      if curl -fSL --retry 2 --retry-delay 5 --max-time 60 -o "staging/${DZN}" "$DURL" 2>/dev/null; then
                         echo "OK"; cksum_dl "staging/${DZN}" "$DURL"
                       else echo "N/A"; break; fi
                     done
                   fi
 
-                  # Batch upload: aggTrades every 6 months, others every year
-                  if { [ $IS_BIG -eq 1 ] && ([ $M -eq 6 ] || [ $M -eq 12 ]); } || { [ $IS_BIG -eq 0 ] && [ $M -eq 12 ]; }; then
+                  # Batch upload: aggTrades every 6 months, others only at the end
+                  if [ $IS_BIG -eq 1 ] && ([ $M -eq 6 ] || [ $M -eq 12 ]); then
                     local LABEL="year ${Y}"
                     [ $IS_BIG -eq 1 ] && LABEL="${Y}-H$(( (M+5)/6 ))"
                     echo "  [BATCH UPLOAD] ${LABEL}..."
@@ -161,14 +175,14 @@ jobs:
                     DZN="${PAIR}-${ZIPFY}-${NOW_Y}-${MM}-${d}.zip"
                     DURL=$(daily_url "$BASE" "$INDNAME" "$PAIR" "$SUB" "$DZN")
                     echo -n "    day ${d} ... "
-                    if curl -fSL --retry 2 --retry-delay 5 --max-time 120 -o "staging/${DZN}" "$DURL" 2>/dev/null; then
+                    if curl -fSL --retry 2 --retry-delay 5 --max-time 60 -o "staging/${DZN}" "$DURL" 2>/dev/null; then
                       echo "OK"; cksum_dl "staging/${DZN}" "$DURL"
                     else echo "N/A"; fi
                   done
                 fi
 
-                echo "  [BATCH UPLOAD] final..."
-                upload_pending
+                echo "  [PACK] ${PAIR}-${INDNAME}..."
+                pack_and_upload "${PAIR}-${INDNAME}"
                 DONE=$((DONE + 1))
               done
 
@@ -193,7 +207,7 @@ jobs:
                     DZN="${PAIR}-${ZIPFY}-${Y}-${MM}-${d}.zip"
                     DURL=$(daily_url "$BASE" "$INDNAME" "$PAIR" "$SUB" "$DZN")
                     echo -n "    ${d} ... "
-                    if curl -fSL --retry 2 --retry-delay 5 --max-time 120 -o "staging/${DZN}" "$DURL" 2>/dev/null; then
+                    if curl -fSL --retry 2 --retry-delay 5 --max-time 60 -o "staging/${DZN}" "$DURL" 2>/dev/null; then
                       echo "OK"; cksum_dl "staging/${DZN}" "$DURL"; GOT=$((GOT+1))
                     else
                       echo "N/A"
@@ -201,13 +215,13 @@ jobs:
                     fi
                   done
                   if [ $M -eq 12 ]; then
-                    echo "  [BATCH UPLOAD] year ${Y}..."
-                    upload_pending
+                    echo "  [PACK] ${PAIR}-${INDNAME}-${Y}..."
+                    pack_and_upload "${PAIR}-${INDNAME}-${Y}"
                   fi
                   M=$((M+1)); if [ $M -gt 12 ]; then M=1; Y=$((Y+1)); fi
                 done
-                echo "  [BATCH UPLOAD] final..."
-                upload_pending
+                echo "  [PACK] ${PAIR}-${INDNAME}..."
+                pack_and_upload "${PAIR}-${INDNAME}"
                 DONE=$((DONE + 1))
               done
 
