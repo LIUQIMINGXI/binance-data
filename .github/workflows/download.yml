@@ -25,7 +25,7 @@ jobs:
           TOTAL_INDICATORS=0  # computed below
           DONE=0
           log_progress() { echo "::group::[${1}%] ${2}"; echo "::endgroup::"; }
-          ndays() { cal $2 $1 2>/dev/null | awk 'NF {d=$NF} END {print d+0}'; }
+          ndays() { date -d "${1}-${2}-01 +1 month -1 day" +%d 2>/dev/null || echo 30; }
 
           # Create release
           TAG="data-$(date +%Y%m%d-%H%M%S)"
