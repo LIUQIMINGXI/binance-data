@@ -1,0 +1,159 @@
+name: Download Binance Data (Spot + Futures)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Download and Upload
+        run: |
+          set -e
+          PAIRS="ETHUSDT BTCUSDT"
+          START_Y=2020; START_M=1
+          NOW_Y=$(date +%Y); NOW_M=$(date +%-m); NOW_D=$(date +%-d)
+          if [ $NOW_M -eq 1 ]; then END_Y=$((NOW_Y-1)); END_M=12
+          else END_Y=$NOW_Y; END_M=$((NOW_M-1)); fi
+
+          TAG="data-$(date +%Y%m%d-%H%M%S)"
+          echo "Creating release: $TAG"
+          RELEASE_ID=$(curl -sL \
+            -X POST -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $TOKEN" \
+            "https://api.github.com/repos/$REPO/releases" \
+            -d "{\"tag_name\":\"$TAG\",\"name\":\"Binance Spot+Futures BTC+ETH\",\"body\":\"Auto download\"}" \
+            | jq -r '.id')
+          echo "Release ID: $RELEASE_ID"
+
+          upload() { local F=$1 N=$2; curl -sL -X POST \
+            -H "Accept: application/vnd.github+json" -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/octet-stream" \
+            "https://uploads.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=${N}" \
+            --data-binary "@$F" > /dev/null; rm -f "$F"; }
+
+          ndays() { cal $2 $1 2>/dev/null | awk 'NF {d=$NF} END {print d+0}'; }
+
+          mkdir -p staging
+
+          download_section() {
+            local BASE=$1 SECTION=$2
+            shift 2
+            local IND_M=("${!1}"); shift
+            local IND_D=("${!1}"); shift
+
+            for PAIR in $PAIRS; do
+
+              for entry in "${IND_M[@]}"; do
+                INDNAME="${entry%%|*}"; SPATH="${entry##*|}"
+                echo "== [${SECTION}] ${PAIR}/${INDNAME} =="
+                Y=$START_Y; M=$START_M
+                while [ $Y -lt $END_Y ] || ([ $Y -eq $END_Y ] && [ $M -le $END_M ]); do
+                  MM=$(printf '%02d' $M)
+                  ZN="${PAIR}-${SPATH##*/}-${Y}-${MM}.zip"
+                  ZURL="${BASE}/monthly/${INDNAME}/${PAIR}/${SPATH%/*}/${ZN}"
+                  echo -n "  [M] ${Y}-${MM} ... "
+                  if curl -fSL --retry 3 --retry-delay 10 -o "staging/${ZN}" "$ZURL" 2>/dev/null; then
+                    echo "$(du -h staging/${ZN} | cut -f1)"
+                    GOT=$(unzip -l "staging/${ZN}" 2>/dev/null | grep -cE '\.(csv|json)$' || echo 0)
+                    NEED=$(ndays $Y $M)
+                    echo "    zip:${GOT} files, calendar:${NEED} days"
+                    upload "staging/${ZN}" "${SECTION}/${PAIR}/${INDNAME}/monthly/${ZN}"
+                    if [ ${GOT:-0} -lt $((NEED - 2)) ]; then
+                      echo "    -> Backfilling missing days..."
+                      for d in $(seq -w 1 $NEED); do
+                        DZN="${PAIR}-${SPATH##*/}-${Y}-${MM}-${d}.zip"
+                        echo -n "      [D] day ${d} ... "
+                        if curl -fSL --retry 2 --retry-delay 5 --max-time 120 -o "staging/${DZN}" \
+                             "${BASE}/daily/${INDNAME}/${PAIR}/${SPATH%/*}/${DZN}" 2>/dev/null; then
+                          echo "OK"; upload "staging/${DZN}" "${SECTION}/${PAIR}/${INDNAME}/daily/${DZN}"
+                        else echo "N/A"; fi
+                      done
+                    fi
+                  else
+                    echo "N/A, falling back to daily..."
+                    NEED=$(ndays $Y $M)
+                    for d in $(seq -w 1 $NEED); do
+                      DZN="${PAIR}-${SPATH##*/}-${Y}-${MM}-${d}.zip"
+                      echo -n "    [D] day ${d} ... "
+                      if curl -fSL --retry 2 --retry-delay 5 --max-time 120 -o "staging/${DZN}" \
+                           "${BASE}/daily/${INDNAME}/${PAIR}/${SPATH%/*}/${DZN}" 2>/dev/null; then
+                        echo "OK"; upload "staging/${DZN}" "${SECTION}/${PAIR}/${INDNAME}/daily/${DZN}"
+                      else echo "N/A"; break; fi
+                    done
+                  fi
+                  M=$((M+1)); if [ $M -gt 12 ]; then M=1; Y=$((Y+1)); fi
+                done
+                if [ $((NOW_D-1)) -ge 1 ]; then
+                  MM=$(printf '%02d' $NOW_M)
+                  echo "  [CURRENT] ${NOW_Y}-${MM} (days 1-$((NOW_D-1)))"
+                  for d in $(seq -w 1 $((NOW_D-1))); do
+                    DZN="${PAIR}-${SPATH##*/}-${NOW_Y}-${MM}-${d}.zip"
+                    echo -n "    day ${d} ... "
+                    if curl -fSL --retry 2 --retry-delay 5 --max-time 120 -o "staging/${DZN}" \
+                         "${BASE}/daily/${INDNAME}/${PAIR}/${SPATH%/*}/${DZN}" 2>/dev/null; then
+                      echo "OK"; upload "staging/${DZN}" "${SECTION}/${PAIR}/${INDNAME}/daily/${DZN}"
+                    else echo "N/A"; fi
+                  done
+                fi
+              done
+
+              for entry in "${IND_D[@]}"; do
+                INDNAME="${entry%%|*}"; SPATH="${entry##*|}"
+                echo "== [${SECTION}] ${PAIR}/${INDNAME} (daily only) =="
+                Y=$START_Y; M=$START_M
+                while [ $Y -lt $NOW_Y ] || ([ $Y -le $NOW_Y ] && [ $M -le $NOW_M ]); do
+                  MM=$(printf '%02d' $M)
+                  NEED=$(ndays $Y $M)
+                  if [ $Y -eq $NOW_Y ] && [ $M -eq $NOW_M ]; then NEED=$((NOW_D-1)); fi
+                  if [ -z "$NEED" ] || [ "$NEED" -lt 1 ]; then M=$((M+1)); continue; fi
+                  echo "  [D] ${Y}-${MM} (${NEED} days)"
+                  GOT=0
+                  for d in $(seq -w 1 $NEED); do
+                    DZN="${PAIR}-${SPATH##*/}-${Y}-${MM}-${d}.zip"
+                    echo -n "    ${d} ... "
+                    if curl -fSL --retry 2 --retry-delay 5 --max-time 120 -o "staging/${DZN}" \
+                         "${BASE}/daily/${INDNAME}/${PAIR}/${SPATH%/*}/${DZN}" 2>/dev/null; then
+                      echo "OK"; upload "staging/${DZN}" "${SECTION}/${PAIR}/${INDNAME}/daily/${DZN}"
+                      GOT=$((GOT+1))
+                    else
+                      echo "N/A"
+                      if [ $GOT -eq 0 ] && [ $d -gt 3 ]; then break; fi
+                    fi
+                  done
+                  M=$((M+1)); if [ $M -gt 12 ]; then M=1; Y=$((Y+1)); fi
+                done
+              done
+
+            done
+          }
+
+          FUT_M=(
+            "klines|klines/1m"
+            "aggTrades|aggTrades/aggTrades"
+            "fundingRate|fundingRate/fundingRate"
+            "markPriceKlines|markPriceKlines/1m"
+            "indexPriceKlines|indexPriceKlines/1m"
+            "premiumIndexKlines|premiumIndexKlines/1m"
+          )
+          FUT_D=(
+            "bookDepth|bookDepth/bookDepth"
+            "metrics|metrics/metrics"
+          )
+          download_section "https://data.binance.vision/data/futures/um" "futures" FUT_M[@] FUT_D[@]
+
+          SPOT_M=(
+            "klines|klines/1m"
+            "aggTrades|aggTrades/aggTrades"
+          )
+          SPOT_D=()
+          download_section "https://data.binance.vision/data/spot" "spot" SPOT_M[@] SPOT_D[@]
+
+          echo ""
+          echo "============================================"
+          echo "ALL DONE! Release: https://github.com/$REPO/releases/tag/$TAG"
+          echo "============================================"
