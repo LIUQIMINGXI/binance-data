@@ -7,6 +7,8 @@ jobs:
   download:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    permissions:
+      contents: write
     env:
       TOKEN: ${{ secrets.GITHUB_TOKEN }}
       REPO: ${{ github.repository }}
@@ -20,36 +22,40 @@ jobs:
           if [ $NOW_M -eq 1 ]; then END_Y=$((NOW_Y-1)); END_M=12
           else END_Y=$NOW_Y; END_M=$((NOW_M-1)); fi
 
-          # Compute total months in [START..END] for percent calc
-          TOTAL_MONTHS=$(( (END_Y - START_Y) * 12 + (END_M - START_M) + 1 ))
+          TOTAL_INDICATORS=0  # computed below
           DONE=0
-          log_progress() { local P=$1 S=$2; echo "::group::[${P}%] ${S}"; echo "::endgroup::"; }
+          log_progress() { echo "::group::[${1}%] ${2}"; echo "::endgroup::"; }
+          ndays() { cal $2 $1 2>/dev/null | awk 'NF {d=$NF} END {print d+0}'; }
 
+          # Create release
           TAG="data-$(date +%Y%m%d-%H%M%S)"
           echo "Creating release: $TAG"
-          RELEASE_ID=$(curl -sL \
-            -X POST -H "Accept: application/vnd.github+json" \
+          RESP=$(curl -sL -X POST \
+            -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer $TOKEN" \
             "https://api.github.com/repos/$REPO/releases" \
-            -d "{\"tag_name\":\"$TAG\",\"name\":\"Binance Spot+Futures BTC+ETH\",\"body\":\"Auto download\"}" \
-            | jq -r '.id')
+            -d "{\"tag_name\":\"$TAG\",\"name\":\"Binance Spot+Futures BTC+ETH\",\"body\":\"Auto download\"}")
+          RELEASE_ID=$(echo "$RESP" | jq -r '.id')
+          if [ "$RELEASE_ID" = "null" ] || [ -z "$RELEASE_ID" ]; then
+            echo "ERROR creating release:"; echo "$RESP"; exit 1
+          fi
           echo "Release ID: $RELEASE_ID"
 
-          upload() { local F=$1 N=$2
+          upload() {
             if curl -sL -X POST \
               -H "Accept: application/vnd.github+json" -H "Authorization: Bearer $TOKEN" \
               -H "Content-Type: application/octet-stream" \
-              "https://uploads.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=${N}" \
-              --data-binary "@$F" > /dev/null 2>&1; then
-              rm -f "$F"; echo "      uploaded"
-            else
-              echo "      upload FAILED, keeping $F"
-            fi
+              "https://uploads.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=${2}" \
+              --data-binary "@${1}" > /dev/null 2>&1; then
+              rm -f "${1}"; echo "      uploaded"
+            else echo "      upload FAILED, keeping ${1}"; fi
           }
+          cksum_dl() { curl -sS --retry 1 -o "${1}.CHECKSUM" "${2}.CHECKSUM" 2>/dev/null || true; }
 
           upload_pending() {
             if ls staging/*.zip staging/*.CHECKSUM >/dev/null 2>&1; then
-              echo "  [BATCH UPLOAD] $(ls staging/*.zip staging/*.CHECKSUM 2>/dev/null | wc -l) files..."
+              local COUNT=$(ls staging/*.zip staging/*.CHECKSUM 2>/dev/null | wc -l)
+              echo "  [BATCH UPLOAD] ${COUNT} files..."
               for F in staging/*.zip staging/*.CHECKSUM; do
                 [ -f "$F" ] || continue
                 upload "$F" "${SECTION}/${PAIR}/${INDNAME}/$(basename $F)"
@@ -57,216 +63,161 @@ jobs:
             fi
           }
 
-          ndays() { cal $2 $1 2>/dev/null | awk 'NF {d=$NF} END {print d+0}'; }
-          cksum() { curl -sS --retry 1 -o "${1}.CHECKSUM" "${2}.CHECKSUM" 2>/dev/null || true; }
-
           mkdir -p staging
 
+          # ----- download helpers -----
+          # monthly_url: BASE INDNAME PAIR SUB FNAME
+          monthly_url() {
+            if [ -n "$4" ]; then echo "${1}/monthly/${2}/${3}/${4}/${5}"
+            else echo "${1}/monthly/${2}/${3}/${5}"; fi
+          }
+          # daily_url: BASE INDNAME PAIR SUB FNAME
+          daily_url() {
+            if [ -n "$4" ]; then echo "${1}/daily/${2}/${3}/${4}/${5}"
+            else echo "${1}/daily/${2}/${3}/${5}"; fi
+          }
+
           download_section() {
-            local BASE=$1 SECTION=$2
-            shift 2
-            local IND_M=("${!1}"); shift
-            local IND_D=("${!1}"); shift
+            local BASE=$1 SECTION=$2; shift 2
+            local IND_M=("${!1}"); shift; local IND_D=("${!1}"); shift
 
             for PAIR in $PAIRS; do
 
+              # ----- monthly indicators -----
               for entry in "${IND_M[@]}"; do
-                INDNAME="${entry%%|*}"; SPATH="${entry##*|}"
+                INDNAME="${entry%%:*}"; SUB="${entry#*:}"
                 echo "== [${SECTION}] ${PAIR}/${INDNAME} =="
-                # Large indicator: upload immediately, one file at a time
-                if [ "$INDNAME" = "aggTrades" ]; then
-                  Y=$START_Y; M=$START_M
-                  while [ $Y -lt $END_Y ] || ([ $Y -eq $END_Y ] && [ $M -le $END_M ]); do
-                    MM=$(printf '%02d' $M)
-                    PCT=$((DONE * 100 / TOTAL_MONTHS))
-                    log_progress "$PCT" "[${SECTION}/${PAIR}/aggTrades] ${Y}-${MM}"
-                    ZN="${PAIR}-${SPATH##*/}-${Y}-${MM}.zip"
-                    ZURL="${BASE}/monthly/${INDNAME}/${PAIR}/${SPATH%/*}/${ZN}"
-                    echo -n "  [M] ${Y}-${MM} ... "
-                    if curl -fSL --retry 3 --retry-delay 10 -o "staging/${ZN}" "$ZURL" 2>/dev/null; then
-                      echo "$(du -h staging/${ZN} | cut -f1)"
-                      cksum "staging/${ZN}" "$ZURL"
-                      GOT=$(unzip -l "staging/${ZN}" 2>/dev/null | grep -cE '\.(csv|json)$' || echo 0)
-                      NEED=$(ndays $Y $M)
-                      echo "    zip:${GOT} files, calendar:${NEED} days"
-                      if [ ${GOT:-0} -lt $NEED ]; then
-                        echo "    -> Backfilling missing days..."
-                        ZIP_DAYS=$(unzip -l "staging/${ZN}" 2>/dev/null | grep -oE "${Y}-${MM}-[0-9]{2}" | sed "s/${Y}-${MM}-//" | sort -u)
-                        for d in $(seq -w 1 $NEED); do
-                          if echo "$ZIP_DAYS" | grep -qw "$d"; then continue; fi
-                          DZN="${PAIR}-${SPATH##*/}-${Y}-${MM}-${d}.zip"
-                          echo -n "      [D] day ${d} ... "
-                          if curl -fSL --retry 2 --retry-delay 5 --max-time 120 -o "staging/${DZN}" \
-                               "${BASE}/daily/${INDNAME}/${PAIR}/${SPATH%/*}/${DZN}" 2>/dev/null; then
-                            echo "OK"; cksum "staging/${DZN}" "${BASE}/daily/${INDNAME}/${PAIR}/${SPATH%/*}/${DZN}"
-                          else echo "N/A"; fi
-                        done
-                      fi
-                    else
-                      echo "N/A, falling back to daily..."
-                      NEED=$(ndays $Y $M)
+                local ZIPFY="${SUB:-${INDNAME}}"  # suffix for zip name
+                local IS_BIG=0; [ "$INDNAME" = "aggTrades" ] && IS_BIG=1 || true
+
+                Y=$START_Y; M=$START_M
+                while [ $Y -lt $END_Y ] || ([ $Y -eq $END_Y ] && [ $M -le $END_M ]); do
+                  MM=$(printf '%02d' $M)
+                  local PCT=$((DONE * 100 / TOTAL_INDICATORS))
+                  log_progress "$PCT" "[${SECTION}/${PAIR}/${INDNAME}] ${Y}-${MM}"
+
+                  ZN="${PAIR}-${ZIPFY}-${Y}-${MM}.zip"
+                  MURL=$(monthly_url "$BASE" "$INDNAME" "$PAIR" "$SUB" "$ZN")
+                  echo -n "  [M] ${Y}-${MM} ... "
+
+                  if curl -fSL --retry 3 --retry-delay 10 -o "staging/${ZN}" "$MURL" 2>/dev/null; then
+                    echo "$(du -h staging/${ZN} | cut -f1)"
+                    cksum_dl "staging/${ZN}" "$MURL"
+                    local GOT=$(unzip -l "staging/${ZN}" 2>/dev/null | grep -cE '\.(csv|json)$' || echo 0)
+                    local NEED=$(ndays $Y $M)
+                    echo "    zip:${GOT} files, calendar:${NEED} days"
+
+                    if [ ${GOT:-0} -lt $NEED ]; then
+                      echo "    -> Backfilling missing days..."
+                      local ZIP_DAYS=$(unzip -l "staging/${ZN}" 2>/dev/null | grep -oE "${Y}-${MM}-[0-9]{2}" | sed "s/${Y}-${MM}-//" | sort -u)
                       for d in $(seq -w 1 $NEED); do
-                        DZN="${PAIR}-${SPATH##*/}-${Y}-${MM}-${d}.zip"
-                        if [ -f "staging/${DZN}" ]; then echo -n "    [D] day ${d} ... SKIP"; echo ""; continue; fi
-                        echo -n "    [D] day ${d} ... "
-                        if curl -fSL --retry 2 --retry-delay 5 --max-time 120 -o "staging/${DZN}" \
-                             "${BASE}/daily/${INDNAME}/${PAIR}/${SPATH%/*}/${DZN}" 2>/dev/null; then
-                          echo "OK"; cksum "staging/${DZN}" "${BASE}/daily/${INDNAME}/${PAIR}/${SPATH%/*}/${DZN}"
-                        else echo "N/A"; break; fi
+                        if echo "$ZIP_DAYS" | grep -qw "$d"; then continue; fi
+                        DZN="${PAIR}-${ZIPFY}-${Y}-${MM}-${d}.zip"
+                        DURL=$(daily_url "$BASE" "$INDNAME" "$PAIR" "$SUB" "$DZN")
+                        echo -n "      [D] day ${d} ... "
+                        if curl -fSL --retry 2 --retry-delay 5 --max-time 120 -o "staging/${DZN}" "$DURL" 2>/dev/null; then
+                          echo "OK"; cksum_dl "staging/${DZN}" "$DURL"
+                        else echo "N/A"; fi
                       done
                     fi
-                    # Batch upload every 6 months (June=6, Dec=12)
-                    if [ $M -eq 6 ] || [ $M -eq 12 ]; then
-                      echo "  [BATCH UPLOAD] ${Y}-H$(( (M+5)/6 ))..."
-                      upload_pending
-                    fi
-                    M=$((M+1)); if [ $M -gt 12 ]; then M=1; Y=$((Y+1)); fi
-                  done
-                  # Current incomplete month
-                  if [ $((NOW_D-1)) -ge 1 ]; then
-                    MM=$(printf '%02d' $NOW_M)
-                    echo "  [CURRENT] ${NOW_Y}-${MM} (days 1-$((NOW_D-1)))"
-                    for d in $(seq -w 1 $((NOW_D-1))); do
-                      DZN="${PAIR}-${SPATH##*/}-${NOW_Y}-${MM}-${d}.zip"
-                        echo -n "    day ${d} ... "
-                        if curl -fSL --retry 2 --retry-delay 5 --max-time 120 -o "staging/${DZN}" \
-                             "${BASE}/daily/${INDNAME}/${PAIR}/${SPATH%/*}/${DZN}" 2>/dev/null; then
-                          echo "OK"; cksum "staging/${DZN}" "${BASE}/daily/${INDNAME}/${PAIR}/${SPATH%/*}/${DZN}"
-                      else echo "N/A"; fi
+                  else
+                    echo "N/A, falling back to daily..."
+                    local NEED=$(ndays $Y $M)
+                    for d in $(seq -w 1 $NEED); do
+                      DZN="${PAIR}-${ZIPFY}-${Y}-${MM}-${d}.zip"
+                      DURL=$(daily_url "$BASE" "$INDNAME" "$PAIR" "$SUB" "$DZN")
+                      if [ -f "staging/${DZN}" ]; then echo -n "    [D] day ${d} ... SKIP"; echo ""; continue; fi
+                      echo -n "    [D] day ${d} ... "
+                      if curl -fSL --retry 2 --retry-delay 5 --max-time 120 -o "staging/${DZN}" "$DURL" 2>/dev/null; then
+                        echo "OK"; cksum_dl "staging/${DZN}" "$DURL"
+                      else echo "N/A"; break; fi
                     done
                   fi
-                  # Final batch upload for leftover
-                  echo "  [BATCH UPLOAD] final..."
-                  upload_pending
-                else
-                  # Small indicator: batch upload per year
-                  Y=$START_Y; M=$START_M
-                  while [ $Y -lt $END_Y ] || ([ $Y -eq $END_Y ] && [ $M -le $END_M ]); do
-                    MM=$(printf '%02d' $M)
-                    PCT=$((DONE * 100 / TOTAL_MONTHS))
-                    log_progress "$PCT" "[${SECTION}/${PAIR}/${INDNAME}] ${Y}-${MM}"
-                    ZN="${PAIR}-${SPATH##*/}-${Y}-${MM}.zip"
-                    ZURL="${BASE}/monthly/${INDNAME}/${PAIR}/${SPATH%/*}/${ZN}"
-                    echo -n "  [M] ${Y}-${MM} ... "
-                    if curl -fSL --retry 3 --retry-delay 10 -o "staging/${ZN}" "$ZURL" 2>/dev/null; then
-                      echo "$(du -h staging/${ZN} | cut -f1)"
-                      cksum "staging/${ZN}" "$ZURL"
-                      GOT=$(unzip -l "staging/${ZN}" 2>/dev/null | grep -cE '\.(csv|json)$' || echo 0)
-                      NEED=$(ndays $Y $M)
-                      echo "    zip:${GOT} files, calendar:${NEED} days"
-                      if [ ${GOT:-0} -lt $NEED ]; then
-                        echo "    -> Backfilling missing days..."
-                        ZIP_DAYS=$(unzip -l "staging/${ZN}" 2>/dev/null | grep -oE "${Y}-${MM}-[0-9]{2}" | sed "s/${Y}-${MM}-//" | sort -u)
-                        for d in $(seq -w 1 $NEED); do
-                          if echo "$ZIP_DAYS" | grep -qw "$d"; then continue; fi
-                          DZN="${PAIR}-${SPATH##*/}-${Y}-${MM}-${d}.zip"
-                          echo -n "      [D] day ${d} ... "
-                          if curl -fSL --retry 2 --retry-delay 5 --max-time 120 -o "staging/${DZN}" \
-                               "${BASE}/daily/${INDNAME}/${PAIR}/${SPATH%/*}/${DZN}" 2>/dev/null; then
-                            echo "OK"; cksum "staging/${DZN}" "${BASE}/daily/${INDNAME}/${PAIR}/${SPATH%/*}/${DZN}"
-                          else echo "N/A"; fi
-                        done
-                      fi
-                    else
-                      echo "N/A, falling back to daily..."
-                      NEED=$(ndays $Y $M)
-                      for d in $(seq -w 1 $NEED); do
-                        DZN="${PAIR}-${SPATH##*/}-${Y}-${MM}-${d}.zip"
-                        if [ -f "staging/${DZN}" ]; then echo -n "    [D] day ${d} ... SKIP"; echo ""; continue; fi
-                        echo -n "    [D] day ${d} ... "
-                        if curl -fSL --retry 2 --retry-delay 5 --max-time 120 -o "staging/${DZN}" \
-                             "${BASE}/daily/${INDNAME}/${PAIR}/${SPATH%/*}/${DZN}" 2>/dev/null; then
-                          echo "OK"; cksum "staging/${DZN}" "${BASE}/daily/${INDNAME}/${PAIR}/${SPATH%/*}/${DZN}"
-                        else echo "N/A"; break; fi
-                      done
-                    fi
-                    # Batch upload at end of each year
-                    if [ $M -eq 12 ]; then
-                      echo "  [BATCH UPLOAD] year ${Y}..."
-                      upload_pending
-                    fi
-                    M=$((M+1)); if [ $M -gt 12 ]; then M=1; Y=$((Y+1)); fi
-                  done
-                  # Current incomplete month daily
-                  if [ $((NOW_D-1)) -ge 1 ]; then
-                    MM=$(printf '%02d' $NOW_M)
-                    echo "  [CURRENT] ${NOW_Y}-${MM} (days 1-$((NOW_D-1)))"
-                    for d in $(seq -w 1 $((NOW_D-1))); do
-                      DZN="${PAIR}-${SPATH##*/}-${NOW_Y}-${MM}-${d}.zip"
-                        echo -n "    day ${d} ... "
-                        if curl -fSL --retry 2 --retry-delay 5 --max-time 120 -o "staging/${DZN}" \
-                             "${BASE}/daily/${INDNAME}/${PAIR}/${SPATH%/*}/${DZN}" 2>/dev/null; then
-                          echo "OK"; cksum "staging/${DZN}" "${BASE}/daily/${INDNAME}/${PAIR}/${SPATH%/*}/${DZN}"
-                      else echo "N/A"; fi
-                    done
+
+                  # Batch upload: aggTrades every 6 months, others every year
+                  if { [ $IS_BIG -eq 1 ] && ([ $M -eq 6 ] || [ $M -eq 12 ]); } || { [ $IS_BIG -eq 0 ] && [ $M -eq 12 ]; }; then
+                    local LABEL="year ${Y}"
+                    [ $IS_BIG -eq 1 ] && LABEL="${Y}-H$(( (M+5)/6 ))"
+                    echo "  [BATCH UPLOAD] ${LABEL}..."
+                    upload_pending
                   fi
-                  # Final batch upload for this indicator
-                  echo "  [BATCH UPLOAD] final..."
-                  upload_pending
+                  M=$((M+1)); if [ $M -gt 12 ]; then M=1; Y=$((Y+1)); fi
+                done
+
+                # Current incomplete month
+                if [ $((NOW_D-1)) -ge 1 ]; then
+                  MM=$(printf '%02d' $NOW_M)
+                  echo "  [CURRENT] ${NOW_Y}-${MM} (days 1-$((NOW_D-1)))"
+                  for d in $(seq -w 1 $((NOW_D-1))); do
+                    DZN="${PAIR}-${ZIPFY}-${NOW_Y}-${MM}-${d}.zip"
+                    DURL=$(daily_url "$BASE" "$INDNAME" "$PAIR" "$SUB" "$DZN")
+                    echo -n "    day ${d} ... "
+                    if curl -fSL --retry 2 --retry-delay 5 --max-time 120 -o "staging/${DZN}" "$DURL" 2>/dev/null; then
+                      echo "OK"; cksum_dl "staging/${DZN}" "$DURL"
+                    else echo "N/A"; fi
+                  done
                 fi
+
+                echo "  [BATCH UPLOAD] final..."
+                upload_pending
                 DONE=$((DONE + 1))
               done
 
+              # ----- daily-only indicators -----
               for entry in "${IND_D[@]}"; do
-                INDNAME="${entry%%|*}"; SPATH="${entry##*|}"
-                echo "== [${SECTION}] ${PAIR}/${INDNAME} (daily only, batch by year) =="
+                INDNAME="${entry%%:*}"; SUB="${entry#*:}"
+                echo "== [${SECTION}] ${PAIR}/${INDNAME} (daily only) =="
+                local ZIPFY="${SUB:-${INDNAME}}"
+
                 Y=$START_Y; M=$START_M
                 while [ $Y -lt $NOW_Y ] || ([ $Y -le $NOW_Y ] && [ $M -le $NOW_M ]); do
                   MM=$(printf '%02d' $M)
-                  PCT=$((DONE * 100 / TOTAL_MONTHS))
-                  log_progress "$PCT" "[futures/${PAIR}/${INDNAME}] processing ${Y}-${MM}"
-                  NEED=$(ndays $Y $M)
+                  local NEED=$(ndays $Y $M)
                   if [ $Y -eq $NOW_Y ] && [ $M -eq $NOW_M ]; then NEED=$((NOW_D-1)); fi
                   if [ -z "$NEED" ] || [ "$NEED" -lt 1 ]; then M=$((M+1)); continue; fi
+
+                  local PCT=$((DONE * 100 / TOTAL_INDICATORS))
+                  log_progress "$PCT" "[${SECTION}/${PAIR}/${INDNAME}] ${Y}-${MM}"
                   echo "  [D] ${Y}-${MM} (${NEED} days)"
-                  GOT=0
+                  local GOT=0
                   for d in $(seq -w 1 $NEED); do
-                    DZN="${PAIR}-${SPATH##*/}-${Y}-${MM}-${d}.zip"
+                    DZN="${PAIR}-${ZIPFY}-${Y}-${MM}-${d}.zip"
+                    DURL=$(daily_url "$BASE" "$INDNAME" "$PAIR" "$SUB" "$DZN")
                     echo -n "    ${d} ... "
-                    if curl -fSL --retry 2 --retry-delay 5 --max-time 120 -o "staging/${DZN}" \
-                         "${BASE}/daily/${INDNAME}/${PAIR}/${SPATH%/*}/${DZN}" 2>/dev/null; then
-                      echo "OK"; cksum "staging/${DZN}" "${BASE}/daily/${INDNAME}/${PAIR}/${SPATH%/*}/${DZN}"
-                      GOT=$((GOT+1))
+                    if curl -fSL --retry 2 --retry-delay 5 --max-time 120 -o "staging/${DZN}" "$DURL" 2>/dev/null; then
+                      echo "OK"; cksum_dl "staging/${DZN}" "$DURL"; GOT=$((GOT+1))
                     else
                       echo "N/A"
                       if [ $GOT -eq 0 ] && [ $d -gt 3 ]; then break; fi
                     fi
                   done
-                  # Batch upload entire year (year-end flush)
                   if [ $M -eq 12 ]; then
                     echo "  [BATCH UPLOAD] year ${Y}..."
                     upload_pending
                   fi
                   M=$((M+1)); if [ $M -gt 12 ]; then M=1; Y=$((Y+1)); fi
                 done
+                echo "  [BATCH UPLOAD] final..."
+                upload_pending
                 DONE=$((DONE + 1))
               done
 
             done
           }
 
-          FUT_M=(
-            "klines|klines/1m"
-            "aggTrades|aggTrades/aggTrades"
-            "fundingRate|fundingRate/fundingRate"
-            "markPriceKlines|markPriceKlines/1m"
-            "indexPriceKlines|indexPriceKlines/1m"
-            "premiumIndexKlines|premiumIndexKlines/1m"
-          )
-          FUT_D=(
-            "bookDepth|bookDepth/bookDepth"
-            "metrics|metrics/metrics"
-          )
-          download_section "https://data.binance.vision/data/futures/um" "futures" FUT_M[@] FUT_D[@]
-
-          SPOT_M=(
-            "klines|klines/1m"
-            "aggTrades|aggTrades/aggTrades"
-          )
+          # ----- Indicator definitions: "name:subfolder" -----
+          # subfolder = ""  means no subfolder in URL, zip uses indicator name
+          # subfolder = "1m" means URL has /1m/, zip uses "1m" as suffix
+          FUT_M=("klines:1m" "aggTrades:" "fundingRate:"
+                 "markPriceKlines:1m" "indexPriceKlines:1m" "premiumIndexKlines:1m")
+          FUT_D=("bookDepth:" "metrics:")
+          SPOT_M=("klines:1m" "aggTrades:")
           SPOT_D=()
+
+          TOTAL_INDICATORS=$(( (${#FUT_M[@]} + ${#FUT_D[@]} + ${#SPOT_M[@]} + ${#SPOT_D[@]}) * 2 ))
+          echo "Total indicator pairs: $TOTAL_INDICATORS"
+
+          download_section "https://data.binance.vision/data/futures/um" "futures" FUT_M[@] FUT_D[@]
           download_section "https://data.binance.vision/data/spot" "spot" SPOT_M[@] SPOT_D[@]
 
-          echo ""
-          echo "============================================"
           echo "ALL DONE! Release: https://github.com/$REPO/releases/tag/$TAG"
-          echo "============================================"
