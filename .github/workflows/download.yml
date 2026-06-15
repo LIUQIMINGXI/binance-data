@@ -107,7 +107,16 @@ jobs:
                     local NEED=$(ndays $Y $M)
                     echo "    zip:${GOT} files, calendar:${NEED} days"
 
-                    if [ ${GOT:-0} -lt $NEED ]; then
+                    # Completeness: klines-like = 1 file OK; aggTrades/fundingRate = all days
+                    if [ -n "$SUB" ]; then
+                      # Has subfolder (klines-type): monthly = single aggregated file
+                      if [ ${GOT:-0} -ge 1 ]; then SKIP_BACKFILL=1; else SKIP_BACKFILL=0; fi
+                    else
+                      # No subfolder (aggTrades/fundingRate): must have all days
+                      if [ ${GOT:-0} -lt $NEED ]; then SKIP_BACKFILL=0; else SKIP_BACKFILL=1; fi
+                    fi
+
+                    if [ ${SKIP_BACKFILL:-0} -eq 0 ]; then
                       echo "    -> Backfilling missing days..."
                       local ZIP_DAYS=$(unzip -l "staging/${ZN}" 2>/dev/null | grep -oE "${Y}-${MM}-[0-9]{2}" | sed "s/${Y}-${MM}-//" | sort -u)
                       for d in $(seq -w 1 $NEED); do
